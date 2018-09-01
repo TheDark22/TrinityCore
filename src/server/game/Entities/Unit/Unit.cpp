@@ -30,7 +30,6 @@
 #include "ConditionMgr.h"
 #include "CreatureAI.h"
 #include "CreatureAIImpl.h"
-#include "CreatureGroups.h"
 #include "Formulas.h"
 #include "GameTime.h"
 #include "GridNotifiersImpl.h"
@@ -288,10 +287,9 @@ bool DispelableAura::RollDispel() const
 }
 
 Unit::Unit(bool isWorldObject) :
-    WorldObject(isWorldObject), m_playerMovingMe(nullptr), m_lastSanctuaryTime(0),
-    LastCharmerGUID(), m_ControlledByPlayer(false),
-    movespline(new Movement::MoveSpline()), m_AutoRepeatFirstCast(false), m_procDeep(0), m_removedAurasCount(0),
-    m_charmer(nullptr), m_charmed(nullptr),
+    WorldObject(isWorldObject), m_playerMovingMe(nullptr), m_lastSanctuaryTime(0), LastCharmerGUID(),
+    movespline(new Movement::MoveSpline()), m_ControlledByPlayer(false), m_AutoRepeatFirstCast(false),
+    m_procDeep(0), m_transformSpell(0), m_removedAurasCount(0), m_charmer(nullptr), m_charmed(nullptr),
     i_motionMaster(new MotionMaster(this)), m_regenTimer(0), m_vehicle(nullptr), m_vehicleKit(nullptr),
     m_unitTypeMask(UNIT_MASK_NONE), m_Diminishing(), m_combatManager(this), m_threatManager(this),
     m_comboTarget(nullptr), m_comboPoints(0), m_spellHistory(new SpellHistory(this))
@@ -328,7 +326,6 @@ Unit::Unit(bool isWorldObject) :
     m_auraUpdateIterator = m_ownedAuras.end();
 
     m_interruptMask = 0;
-    m_transform = 0;
     m_canModifyStats = false;
 
     for (uint8 i = 0; i < UNIT_MOD_END; ++i)
@@ -6001,8 +5998,9 @@ void Unit::SetCharm(Unit* charm, bool apply)
     {
         if (GetTypeId() == TYPEID_PLAYER)
         {
-            if (!SetCharmedData(charm))
-                TC_LOG_FATAL("entities.unit", "Player %s is trying to charm unit %u, but it already has a charmed unit %s", GetName().c_str(), charm->GetEntry(), GetCharmedGUID().ToString().c_str());
+            ASSERT(AddGuidValue(UNIT_FIELD_CHARM, charm->GetGUID()),
+                "Player %s is trying to charm unit %u, but it already has a charmed unit %s", GetName().c_str(), charm->GetEntry(), GetCharmedGUID().ToString().c_str());
+            m_charmed = charm;
 
             charm->m_ControlledByPlayer = true;
             /// @todo maybe we can use this flag to check if controlled by player
@@ -6014,8 +6012,9 @@ void Unit::SetCharm(Unit* charm, bool apply)
         // PvP, FFAPvP
         charm->SetByteValue(UNIT_FIELD_BYTES_2, UNIT_BYTES_2_OFFSET_PVP_FLAG, GetByteValue(UNIT_FIELD_BYTES_2, UNIT_BYTES_2_OFFSET_PVP_FLAG));
 
-        if (!charm->SetCharmerData(this))
-            TC_LOG_FATAL("entities.unit", "Unit %u is being charmed, but it already has a charmer %s", charm->GetEntry(), charm->GetCharmerGUID().ToString().c_str());
+        ASSERT(charm->AddGuidValue(UNIT_FIELD_CHARMEDBY, GetGUID()),
+            "Unit %u is being charmed, but it already has a charmer %s", charm->GetEntry(), charm->GetCharmerGUID().ToString().c_str());
+        charm->m_charmer = this;
 
         _isWalkingBeforeCharm = charm->IsWalking();
         if (_isWalkingBeforeCharm)
@@ -6032,12 +6031,14 @@ void Unit::SetCharm(Unit* charm, bool apply)
 
         if (GetTypeId() == TYPEID_PLAYER)
         {
-            if (!ClearCharmedData(charm))
-                TC_LOG_FATAL("entities.unit", "Player %s is trying to uncharm unit %u, but it has another charmed unit %s", GetName().c_str(), charm->GetEntry(), GetCharmedGUID().ToString().c_str());
+            ASSERT(RemoveGuidValue(UNIT_FIELD_CHARM, charm->GetGUID()),
+                "Player %s is trying to uncharm unit %u, but it has another charmed unit %s", GetName().c_str(), charm->GetEntry(), GetCharmedGUID().ToString().c_str());
+            m_charmed = nullptr;
         }
 
-        if (!charm->ClearCharmerData(this))
-            TC_LOG_FATAL("entities.unit", "Unit %u is being uncharmed, but it has another charmer %s", charm->GetEntry(), charm->GetCharmerGUID().ToString().c_str());
+        ASSERT(charm->RemoveGuidValue(UNIT_FIELD_CHARMEDBY, GetGUID()),
+            "Unit %u is being uncharmed, but it has another charmer %s", charm->GetEntry(), charm->GetCharmerGUID().ToString().c_str());
+        charm->m_charmer = nullptr;
 
         if (charm->GetTypeId() == TYPEID_PLAYER)
         {
@@ -8151,10 +8152,6 @@ void Unit::EngageWithTarget(Unit* enemy)
         m_threatManager.AddThreat(enemy, 0.0f, nullptr, true, true);
     else
         SetInCombatWith(enemy);
-
-    if (Creature* creature = ToCreature())
-        if (CreatureGroup* formation = creature->GetFormation())
-            formation->MemberEngagingTarget(creature, enemy);
 }
 
 void Unit::AttackedTarget(Unit* target, bool canInitialAggro)
@@ -8181,16 +8178,11 @@ void Unit::SetImmuneToAll(bool apply, bool keepCombat)
     {
         SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_IMMUNE_TO_NPC);
         ValidateAttackersAndOwnTarget();
-        if (keepCombat)
-            m_threatManager.UpdateOnlineStates(true, true);
-        else
+        if (!keepCombat)
             m_combatManager.EndAllCombat();
     }
     else
-    {
         RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_IMMUNE_TO_NPC);
-        m_threatManager.UpdateOnlineStates(true, true);
-    }
 }
 
 void Unit::SetImmuneToPC(bool apply, bool keepCombat)
@@ -8199,9 +8191,7 @@ void Unit::SetImmuneToPC(bool apply, bool keepCombat)
     {
         SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PC);
         ValidateAttackersAndOwnTarget();
-        if (keepCombat)
-            m_threatManager.UpdateOnlineStates(true, true);
-        else
+        if (!keepCombat)
         {
             std::list<CombatReference*> toEnd;
             for (auto const& pair : m_combatManager.GetPvECombatRefs())
@@ -8215,10 +8205,7 @@ void Unit::SetImmuneToPC(bool apply, bool keepCombat)
         }
     }
     else
-    {
         RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PC);
-        m_threatManager.UpdateOnlineStates(true, true);
-    }
 }
 
 void Unit::SetImmuneToNPC(bool apply, bool keepCombat)
@@ -8227,9 +8214,7 @@ void Unit::SetImmuneToNPC(bool apply, bool keepCombat)
     {
         SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_NPC);
         ValidateAttackersAndOwnTarget();
-        if (keepCombat)
-            m_threatManager.UpdateOnlineStates(true, true);
-        else
+        if (!keepCombat)
         {
             std::list<CombatReference*> toEnd;
             for (auto const& pair : m_combatManager.GetPvECombatRefs())
@@ -8243,10 +8228,7 @@ void Unit::SetImmuneToNPC(bool apply, bool keepCombat)
         }
     }
     else
-    {
         RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_NPC);
-        m_threatManager.UpdateOnlineStates(true, true);
-    }
 }
 
 bool Unit::IsThreatened() const
@@ -8869,7 +8851,7 @@ bool Unit::IsInFeralForm() const
 
 bool Unit::IsInDisallowedMountForm() const
 {
-    if (SpellInfo const* transformSpellInfo = sSpellMgr->GetSpellInfo(getTransForm()))
+    if (SpellInfo const* transformSpellInfo = sSpellMgr->GetSpellInfo(GetTransformSpell()))
         if (transformSpellInfo->HasAttribute(SPELL_ATTR0_CASTABLE_WHILE_MOUNTED))
             return false;
 
@@ -9586,10 +9568,10 @@ CharmInfo::CharmInfo(Unit* unit)
     for (uint8 i = 0; i < MAX_SPELL_CHARM; ++i)
         _charmspells[i].SetActionAndType(0, ACT_DISABLED);
 
-    if (_unit->GetTypeId() == TYPEID_UNIT)
+    if (Creature* creature = _unit->ToCreature())
     {
-        _oldReactState = _unit->ToCreature()->GetReactState();
-        _unit->ToCreature()->SetReactState(REACT_PASSIVE);
+        _oldReactState = creature->GetReactState();
+        creature->SetReactState(REACT_PASSIVE);
     }
 }
 
@@ -9844,11 +9826,6 @@ Player* Unit::GetPlayerBeingMoved() const
     if (Unit* mover = GetUnitBeingMoved())
         return mover->ToPlayer();
     return nullptr;
-}
-
-bool Unit::isFrozen() const
-{
-    return HasAuraState(AURA_STATE_FROZEN);
 }
 
 uint32 createProcHitMask(SpellNonMeleeDamage* damageInfo, SpellMissInfo missCondition)
@@ -10222,7 +10199,7 @@ void Unit::SetStandState(uint8 state)
 
 bool Unit::IsPolymorphed() const
 {
-    uint32 transformId = getTransForm();
+    uint32 transformId = GetTransformSpell();
     if (!transformId)
         return false;
 
@@ -11376,26 +11353,12 @@ bool Unit::SetCharmedBy(Unit* charmer, CharmType type, AuraApplication const* au
         GetMotionMaster()->Clear(MOTION_PRIORITY_NORMAL);
 
         StopMoving();
-
-        // AI will schedule its own change if appropriate
-        if (UnitAI* ai = GetAI())
-            ai->OnCharmed(false);
-        else
-            ScheduleAIChange();
     }
     else if (Player* player = ToPlayer())
     {
         if (player->isAFK())
             player->ToggleAFK();
 
-        if (charmer->GetTypeId() == TYPEID_UNIT) // we are charmed by a creature
-        {
-            // change AI to charmed AI on next Update tick
-            if (UnitAI* ai = GetAI())
-                ai->OnCharmed(false);
-            else
-                player->ScheduleAIChange();
-        }
         player->SetClientControl(this, false);
     }
 
@@ -11456,6 +11419,15 @@ bool Unit::SetCharmedBy(Unit* charmer, CharmType type, AuraApplication const* au
     }
 
     AddUnitState(UNIT_STATE_CHARMED);
+
+    if ((GetTypeId() != TYPEID_PLAYER) || (charmer->GetTypeId() != TYPEID_PLAYER))
+    {
+        // AI will schedule its own change if appropriate
+        if (UnitAI* ai = GetAI())
+            ai->OnCharmed(false);
+        else
+            ScheduleAIChange();
+    }
     return true;
 }
 
@@ -11464,15 +11436,12 @@ void Unit::RemoveCharmedBy(Unit* charmer)
     if (!IsCharmed())
         return;
 
-    if (!charmer)
+    if (charmer)
+        ASSERT(charmer == GetCharmer());
+    else
         charmer = GetCharmer();
-    if (charmer != GetCharmer()) // one aura overrides another?
-    {
-//        TC_LOG_FATAL("entities.unit", "Unit::RemoveCharmedBy: this: " UI64FMTD " true charmer: " UI64FMTD " false charmer: " UI64FMTD,
-//            GetGUID(), GetCharmerGUID(), charmer->GetGUID());
-//        ABORT();
-        return;
-    }
+
+    ASSERT(charmer);
 
     CharmType type;
     if (HasUnitState(UNIT_STATE_POSSESSED))
@@ -11498,11 +11467,7 @@ void Unit::RemoveCharmedBy(Unit* charmer)
 
     // Vehicle should not attack its passenger after he exists the seat
     if (type != CHARM_TYPE_VEHICLE)
-        LastCharmerGUID = ASSERT_NOTNULL(charmer)->GetGUID();
-
-    // If charmer still exists
-    if (!charmer)
-        return;
+        LastCharmerGUID = charmer->GetGUID();
 
     ASSERT(type != CHARM_TYPE_POSSESS || charmer->GetTypeId() == TYPEID_PLAYER);
     ASSERT(type != CHARM_TYPE_VEHICLE || (GetTypeId() == TYPEID_UNIT && IsVehicle()));
@@ -11545,6 +11510,19 @@ void Unit::RemoveCharmedBy(Unit* charmer)
         }
     }
 
+    if (Player* player = ToPlayer())
+        player->SetClientControl(this, true);
+
+    if (playerCharmer && this != charmer->GetFirstControlled())
+        playerCharmer->SendRemoveControlBar();
+
+    // a guardian should always have charminfo
+    if (!IsGuardian())
+        DeleteCharmInfo();
+
+    // reset confused movement for example
+    ApplyControlStatesIfNeeded();
+
     if (GetTypeId() != TYPEID_PLAYER || charmer->GetTypeId() == TYPEID_UNIT)
     {
         if (UnitAI* charmedAI = GetAI())
@@ -11552,18 +11530,6 @@ void Unit::RemoveCharmedBy(Unit* charmer)
         else
             ScheduleAIChange();
     }
-
-    if (Player* player = ToPlayer())
-        player->SetClientControl(this, true);
-
-    // a guardian should always have charminfo
-    if (playerCharmer && this != charmer->GetFirstControlled())
-        playerCharmer->SendRemoveControlBar();
-    else if (GetTypeId() == TYPEID_PLAYER || (GetTypeId() == TYPEID_UNIT && !IsGuardian()))
-        DeleteCharmInfo();
-
-    // reset confused movement for example
-    ApplyControlStatesIfNeeded();
 }
 
 void Unit::RestoreFaction()
@@ -11966,7 +11932,6 @@ void Unit::UpdateObjectVisibility(bool forced)
         AddToNotify(NOTIFY_VISIBILITY_CHANGED);
     else
     {
-        m_threatManager.UpdateOnlineStates(true, true);
         WorldObject::UpdateObjectVisibility(true);
         // call MoveInLineOfSight for nearby creatures
         Trinity::AIRelocationNotifier notifier(*this);
@@ -13220,7 +13185,7 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
                     CreatureTemplate const* cinfo = creature->GetCreatureTemplate();
 
                     // this also applies for transform auras
-                    if (SpellInfo const* transform = sSpellMgr->GetSpellInfo(getTransForm()))
+                    if (SpellInfo const* transform = sSpellMgr->GetSpellInfo(GetTransformSpell()))
                         for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
                             if (transform->Effects[i].IsAura(SPELL_AURA_TRANSFORM))
                                 if (CreatureTemplate const* transformInfo = sObjectMgr->GetCreatureTemplate(transform->Effects[i].MiscValue))
